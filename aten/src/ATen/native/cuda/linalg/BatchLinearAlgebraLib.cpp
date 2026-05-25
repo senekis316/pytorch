@@ -42,6 +42,49 @@
 
 namespace at::native {
 
+int get_linalg_num_streams(int default_val) {
+  static int env_val = []() -> int {
+    const char* env = std::getenv("PYTORCH_LINALG_NUM_STREAMS");
+    if (env) {
+      int val = std::atoi(env);
+      if (val > 0) return val;
+    }
+    return -1;
+  }();
+  return (env_val > 0) ? env_val : default_val;
+}
+
+namespace {
+
+template<typename Fn>
+void apply_with_aux_streams(int64_t batch_size, int num_streams, Fn&& fn) {
+  num_streams = std::min<int>(static_cast<int>(batch_size), num_streams);
+
+  const auto main_stream = at::cuda::getCurrentCUDAStream();
+  at::cuda::CUDAEvent event_start;
+  event_start.record(main_stream);
+
+  std::vector<at::cuda::CUDAStream> aux_streams;
+  aux_streams.reserve(num_streams);
+  for (int i = 0; i < num_streams; ++i) {
+    auto aux = at::cuda::getStreamFromPool();
+    event_start.block(aux);
+    aux_streams.push_back(aux);
+  }
+
+  for (int64_t batch = 0; batch < batch_size; ++batch) {
+    fn(batch, aux_streams[batch % num_streams]);
+  }
+
+  std::vector<at::cuda::CUDAEvent> done_events(num_streams);
+  for (int i = 0; i < num_streams; ++i) {
+    done_events[i].record(aux_streams[i]);
+    done_events[i].block(main_stream);
+  }
+}
+
+} // anonymous namespace
+
 static cublasOperation_t to_cublas(TransposeType trans) {
   switch (trans) {
     case TransposeType::NoTranspose: return CUBLAS_OP_N;
@@ -1644,7 +1687,7 @@ void linalg_eig_cusolver_xgeev(const Tensor& eigenvalues, const Tensor& eigenvec
 // The 'apply_' word is used for templated by dtype functions that call an API routine
 // underneath. Since the cusolver API has a slightly different structure we do not prepend
 // apply_ to this function.
-void lu_factor_looped_cusolver(const Tensor& self, const Tensor& pivots, const Tensor& infos, bool get_pivots) {
+void lu_factor_looped_cusolver(const Tensor& self, const Tensor& pivots, const Tensor& infos, bool get_pivots, int num_streams) {
   AT_DISPATCH_FLOATING_AND_COMPLEX_TYPES(
     self.scalar_type(),
     "lu_factor_cusolver",
@@ -1663,16 +1706,39 @@ void lu_factor_looped_cusolver(const Tensor& self, const Tensor& pivots, const T
     const auto pivots_data = get_pivots ? pivots.data_ptr<int>() : nullptr;
     const auto pivots_stride = get_pivots ? pivots.size(-1) : 0;
 
-    const auto handle = at::cuda::getCurrentCUDASolverDnHandle();
-    for (auto batch = decltype(batch_size){0}; batch < batch_size; ++batch) {
-      at::cuda::solver::getrf<scalar_t>(
-        handle, m, n,
-        self_data + batch * self_stride,
-        lda,
-        get_pivots ? pivots_data + batch * pivots_stride : nullptr,
-        infos_data + batch
-      );
+    const int num_streams = std::min<int>(batch_size, 4);
+
+    const auto main_stream = at::cuda::getCurrentCUDAStream();
+    at::cuda::CUDAEvent event_start;
+    event_start.record(main_stream);
+
+    std::vector<at::cuda::CUDAStream> aux_streams;
+    aux_streams.reserve(num_streams);
+    for (int i = 0; i < num_streams; ++i) {
+        const auto aux_stream = at::cuda::getStreamFromPool();
+        event_start.block(aux_stream);
+        aux_streams.push_back(aux_stream);
     }
+
+    const auto handle = at::cuda::getCurrentCUDASolverDnHandle();
+    apply_with_aux_streams(batch_size, num_streams,
+      [&](int64_t batch, const at::cuda::CUDAStream& aux) {
+        cusolverDnSetStream(handle, aux);
+        at::cuda::solver::getrf<scalar_t>(
+          handle, m, n,
+          self_data + batch * self_stride,
+          lda,
+          get_pivots ? pivots_data + batch * pivots_stride : nullptr,
+          infos_data + batch
+        );
+        c10::cuda::CUDACachingAllocator::recordStream(self.storage().data_ptr(), aux);
+        c10::cuda::CUDACachingAllocator::recordStream(infos.storage().data_ptr(), aux);
+        if (get_pivots) {
+          c10::cuda::CUDACachingAllocator::recordStream(pivots.storage().data_ptr(), aux);
+        }
+      }
+    );
+    cusolverDnSetStream(handle, at::cuda::getCurrentCUDAStream());
   });
 
   // Necessary because cuSOLVER uses nan for outputs that correspond to 0 in MAGMA for non-pivoted LU.

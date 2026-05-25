@@ -7161,6 +7161,33 @@ class TestLinalg(TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'LU without pivoting is not implemented on the CPU'):
                     f(torch.empty(1, 2, 2), pivot=False)
 
+    @precisionOverride({torch.float32: 1e-2})
+    @skipCUDAIfNoCusolver
+    @skipIfTorchDynamo("Runtime error with torch._C._linalg.linalg_lu_factor")
+    @onlyCUDA
+    @dtypes(torch.float32, torch.float64)
+    def test_lu_factor_looped_cusolver_multistream(self, device, dtype):
+        # Verifies correctness of the multi-stream parallel implementation.
+        # lu_factor_looped_cusolver is triggered when m >= 512, m != n, or batch_size == 1.
+
+        # Case 1: batch_size > num_streams — main parallel case
+        A = torch.randn(32, 512, 512, device=device, dtype=dtype)
+        LU, pivots = torch.linalg.lu_factor(A)
+        P, L, U = torch.lu_unpack(LU, pivots)
+        self.assertEqual(P @ L @ U, A)
+
+        # Case 2: batch_size < num_streams — stream count is capped at batch_size
+        A = torch.randn(2, 512, 512, device=device, dtype=dtype)
+        LU, pivots = torch.linalg.lu_factor(A)
+        P, L, U = torch.lu_unpack(LU, pivots)
+        self.assertEqual(P @ L @ U, A)
+
+        # Case 3: non-square matrix — also triggers looped path via m != n
+        A = torch.randn(8, 768, 512, device=device, dtype=dtype)
+        LU, pivots = torch.linalg.lu_factor(A)
+        P, L, U = torch.lu_unpack(LU, pivots)
+        self.assertEqual(P @ L @ U, A)
+
     @precisionOverride({torch.float32: 1e-2, torch.complex64: 1e-2})
     @skipCUDAIfNoCusolver
     @skipCPUIfNoLapack

@@ -70,7 +70,11 @@ void linalg_eig_cusolver_xgeev(const Tensor& eigenvalues,
 
 void lu_solve_looped_cusolver(const Tensor& LU, const Tensor& pivots, const Tensor& B, TransposeType transpose);
 
-void lu_factor_looped_cusolver(const Tensor& self, const Tensor& pivots, const Tensor& infos, bool get_pivots);
+// Returns the number of auxiliary CUDA streams to use for looped cuSOLVER calls.
+// Reads PYTORCH_LINALG_NUM_STREAMS env var; falls back to default_val if unset.
+int get_linalg_num_streams(int default_val);
+
+void lu_factor_looped_cusolver(const Tensor& self, const Tensor& pivots, const Tensor& infos, bool get_pivots, int num_streams);
 
 #if defined(BUILD_LAZY_CUDA_LINALG)
 namespace cuda::detail {
