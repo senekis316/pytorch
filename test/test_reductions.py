@@ -763,6 +763,29 @@ class TestReductions(TestCase):
                            [0, 1, 1],
                            [1, 1, 1]], device=device, dtype=torch.uint8))
 
+    @onlyCUDA
+    def test_any_early_exit_cuda(self, device):
+        # contiguous bool, all False
+        x = torch.zeros(1024, dtype=torch.bool, device=device)
+        self.assertFalse(x.any())
+
+        # contiguous bool, last element True
+        x[-1] = True
+        self.assertTrue(x.any())
+
+        # contiguous bool, first element True (early exit at first warp)
+        x = torch.zeros(1024, dtype=torch.bool, device=device)
+        x[0] = True
+        self.assertTrue(x.any())
+
+        # non-contiguous bool: falls back to gpu_reduce_kernel
+        x = torch.zeros(64, 32, dtype=torch.bool, device=device)
+        x_nc = x[:, ::2]
+        self.assertFalse(x_nc.is_contiguous())
+        self.assertFalse(x_nc.any())
+        x_nc[0, 0] = True
+        self.assertTrue(x_nc.any())
+
     def test_numpy_named_args(self, device):
         x1 = torch.randn(10, device=device)
         x2 = torch.randn(10, device=device)
